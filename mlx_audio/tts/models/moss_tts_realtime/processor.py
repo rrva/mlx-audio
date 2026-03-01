@@ -260,6 +260,7 @@ class MossTTSRealtimeProcessor:
             "<|im_start|>context\n"
             "The assistant section should be synthesized using the following voice timbre:"
             f"{padded_audio_prompt}"
+            "<|im_end|>\n"
         )
 
     def make_ensemble(self, prompt_audio_tokens: Optional[mx.array] = None) -> mx.array:
@@ -379,12 +380,34 @@ class MossTTSRealtimeProcessor:
         include_system_prompt: bool = True,
         voice_prompt_tokens: Optional[Any] = None,
     ) -> mx.array:
-        user_prompt = self.make_user_prompt(user_text, user_audio_tokens)
-        if include_system_prompt:
+        has_user_content = bool(user_text) or user_audio_tokens is not None
+
+        if has_user_content:
+            user_prompt = self.make_user_prompt(user_text, user_audio_tokens)
+            if include_system_prompt:
+                system_prompt = self.make_ensemble(voice_prompt_tokens)
+                turn_input = mx.concatenate([system_prompt, user_prompt], axis=0)
+            else:
+                turn_input = user_prompt
+        elif include_system_prompt:
             system_prompt = self.make_ensemble(voice_prompt_tokens)
-            turn_input = mx.concatenate([system_prompt, user_prompt], axis=0)
+            assistant_prefix_tokens = self._tokenize(
+                "<|im_start|>assistant\n", add_special_tokens=None
+            )
+            assistant_prefix = mx.full(
+                (len(assistant_prefix_tokens), self.channels),
+                self.model_config.audio_pad_token,
+                dtype=mx.int32,
+            )
+            assistant_prefix[:, 0] = mx.array(
+                assistant_prefix_tokens, dtype=mx.int32
+            )
+            turn_input = mx.concatenate(
+                [system_prompt, assistant_prefix], axis=0
+            )
         else:
-            turn_input = user_prompt
+            turn_input = self.make_user_prompt(user_text, user_audio_tokens)
+
         return turn_input[None, :, :].astype(mx.int32)
 
     def make_text_prefix(self, text_token_ids: Iterable[int]) -> list[int]:

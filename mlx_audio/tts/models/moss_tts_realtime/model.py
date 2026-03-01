@@ -13,15 +13,14 @@ import mlx.nn as nn
 from mlx_audio.codec.models.moss_audio_tokenizer import MossAudioTokenizer
 from mlx_audio.tts.models.base import GenerationResult
 from mlx_audio.tts.models.moss_tts.backbone import MossTTSBackbone
-from mlx_audio.tts.models.moss_tts.local_model import MossTTSMLP
-from mlx_audio.tts.models.moss_tts.local_transformer import MossTTSLocalTransformer
+
+from .local_transformer import RealtimeLocalTransformer
 from mlx_audio.tts.models.moss_tts.presets import (
     MOSS_TTS_REALTIME_RUNTIME,
     resolve_sampling_preset,
 )
 from mlx_audio.tts.models.moss_tts.sampling import (
     ChannelSamplingConfig,
-    resolve_channel_sampling_configs,
     sample_channel_token,
 )
 
@@ -54,29 +53,17 @@ class MossTTSRealtimeCore(nn.Module):
         ]
 
         self.backbone = MossTTSBackbone(config.language_config)
-        self.local_transformer = MossTTSLocalTransformer(
+        self.local_transformer = RealtimeLocalTransformer(
             config.local_transformer_config()
         )
 
-        local_hidden_size = self.local_transformer.config.hidden_size
-        self.speech_embedding_to_local_mlp = MossTTSMLP(
-            input_size=config.hidden_size,
-            hidden_size=config.local_config.intermediate_size,
-            output_size=local_hidden_size,
-        )
-        self.local_to_speech_embedding_mlps = [
-            MossTTSMLP(
-                input_size=local_hidden_size,
-                hidden_size=config.local_config.intermediate_size,
-                output_size=config.hidden_size,
-            )
-            for _ in range(config.rvq)
+        # Per-codebook embeddings for the local transformer (codebooks 1..rvq-1).
+        # Codebook 0 input is the backbone hidden state directly.
+        self.local_embed_tokens = [
+            nn.Embedding(config.audio_vocab_size, config.local_config.hidden_size)
+            for _ in range(config.rvq - 1)
         ]
 
-        self.layer_norm_before_lm_heads = [
-            nn.RMSNorm(config.hidden_size, eps=config.language_config.rms_norm_eps)
-            for _ in range(config.rvq)
-        ]
         self.lm_heads = [
             nn.Linear(config.hidden_size, config.audio_vocab_size, bias=False)
             for _ in range(config.rvq)
@@ -116,24 +103,13 @@ class MossTTSRealtimeCore(nn.Module):
     ) -> List[mx.array]:
         """Return per-channel logits for one realtime audio frame."""
 
-        batch_size = int(global_hidden_state.shape[0])
-        local_hidden_size = self.local_transformer.config.hidden_size
-        local_inputs = mx.zeros(
-            (batch_size, 0, local_hidden_size), dtype=global_hidden_state.dtype
-        )
-        current_input = self.speech_embedding_to_local_mlp(global_hidden_state)
+        # Position 0: backbone hidden state directly
+        local_inputs = global_hidden_state[:, None, :]
 
         logits_per_channel: List[mx.array] = []
         for channel_idx in range(self.config.rvq):
-            local_inputs = mx.concatenate(
-                [local_inputs, current_input[:, None, :]], axis=1
-            )
             local_outputs = self.local_transformer(local_inputs)
             hidden_state = local_outputs[:, -1, :]
-            hidden_state = self.local_to_speech_embedding_mlps[channel_idx](
-                hidden_state
-            )
-            hidden_state = self.layer_norm_before_lm_heads[channel_idx](hidden_state)
 
             logits = self.lm_heads[channel_idx](hidden_state)
             if 0 <= self.config.audio_pad_token < logits.shape[-1]:
@@ -143,13 +119,16 @@ class MossTTSRealtimeCore(nn.Module):
 
             logits_per_channel.append(logits)
 
-            if local_input_ids is not None:
-                next_token = local_input_ids[:, channel_idx].astype(mx.int32)
-            else:
-                next_token = mx.argmax(logits, axis=-1).astype(mx.int32)
+            if channel_idx < self.config.rvq - 1:
+                if local_input_ids is not None:
+                    next_token = local_input_ids[:, channel_idx].astype(mx.int32)
+                else:
+                    next_token = mx.argmax(logits, axis=-1).astype(mx.int32)
 
-            current_input = self.embedding_list[channel_idx + 1](next_token)
-            current_input = self.speech_embedding_to_local_mlp(current_input)
+                next_embed = self.local_embed_tokens[channel_idx](next_token)
+                local_inputs = mx.concatenate(
+                    [local_inputs, next_embed[:, None, :]], axis=1
+                )
 
         return logits_per_channel
 
@@ -168,24 +147,13 @@ class MossTTSRealtimeCore(nn.Module):
                 f"Expected {self.config.rvq} channel configs, got {len(channel_sampling)}"
             )
 
-        batch_size = int(global_hidden_state.shape[0])
-        local_hidden_size = self.local_transformer.config.hidden_size
-        local_inputs = mx.zeros(
-            (batch_size, 0, local_hidden_size), dtype=global_hidden_state.dtype
-        )
-        current_input = self.speech_embedding_to_local_mlp(global_hidden_state)
+        # Position 0: backbone hidden state directly
+        local_inputs = global_hidden_state[:, None, :]
 
         sampled: List[mx.array] = []
         for channel_idx in range(self.config.rvq):
-            local_inputs = mx.concatenate(
-                [local_inputs, current_input[:, None, :]], axis=1
-            )
             local_outputs = self.local_transformer(local_inputs)
             hidden_state = local_outputs[:, -1, :]
-            hidden_state = self.local_to_speech_embedding_mlps[channel_idx](
-                hidden_state
-            )
-            hidden_state = self.layer_norm_before_lm_heads[channel_idx](hidden_state)
 
             logits = self.lm_heads[channel_idx](hidden_state)
             if 0 <= self.config.audio_pad_token < logits.shape[-1]:
@@ -205,8 +173,13 @@ class MossTTSRealtimeCore(nn.Module):
             )
             sampled.append(token)
 
-            current_input = self.embedding_list[channel_idx + 1](token.astype(mx.int32))
-            current_input = self.speech_embedding_to_local_mlp(current_input)
+            if channel_idx < self.config.rvq - 1:
+                next_embed = self.local_embed_tokens[channel_idx](
+                    token.astype(mx.int32)
+                )
+                local_inputs = mx.concatenate(
+                    [local_inputs, next_embed[:, None, :]], axis=1
+                )
 
         return mx.stack(sampled, axis=-1).astype(mx.int32)
 
@@ -245,8 +218,8 @@ class Model(nn.Module):
             "quantizer",
             "codebook",
             "model.embedding_list",
+            "model.local_embed_tokens",
             "model.lm_heads",
-            "model.layer_norm_before_lm_heads",
         ]
         return not any(pattern in path for pattern in skip_patterns)
 
@@ -264,12 +237,19 @@ class Model(nn.Module):
                 "embed_tokens.weight",
             }:
                 new_key = "model.embedding_list.0.weight"
-            # Upstream local transformer checkpoints can contain this family, but the
-            # runtime local transformer has no embed_tokens parameters to receive it.
-            elif key.startswith(
-                "local_transformer.model.embed_tokens."
-            ) or key.startswith("model.local_transformer.model.embed_tokens."):
-                continue
+            # Local transformer per-codebook embeddings.
+            elif key.startswith("local_transformer.model.embed_tokens."):
+                new_key = key.replace(
+                    "local_transformer.model.embed_tokens.",
+                    "model.local_embed_tokens.",
+                    1,
+                )
+            elif key.startswith("model.local_transformer.model.embed_tokens."):
+                new_key = key.replace(
+                    "model.local_transformer.model.embed_tokens.",
+                    "model.local_embed_tokens.",
+                    1,
+                )
             elif key.startswith("model.language_model.embed_tokens."):
                 new_key = key.replace(
                     "model.language_model.embed_tokens.",
@@ -314,39 +294,9 @@ class Model(nn.Module):
                     "model.lm_heads.",
                     1,
                 )
-            elif key.startswith("local_transformer.layer_norm_before_lm_heads."):
-                new_key = key.replace(
-                    "local_transformer.layer_norm_before_lm_heads.",
-                    "model.layer_norm_before_lm_heads.",
-                    1,
-                )
-            elif key.startswith("model.local_transformer.layer_norm_before_lm_heads."):
-                new_key = key.replace(
-                    "model.local_transformer.layer_norm_before_lm_heads.",
-                    "model.layer_norm_before_lm_heads.",
-                    1,
-                )
             elif key.startswith("local_transformer."):
                 new_key = key.replace(
                     "local_transformer.", "model.local_transformer.", 1
-                )
-            elif key.startswith("speech_embedding_to_local_mlp."):
-                new_key = key.replace(
-                    "speech_embedding_to_local_mlp.",
-                    "model.speech_embedding_to_local_mlp.",
-                    1,
-                )
-            elif key.startswith("local_to_speech_embedding_mlps."):
-                new_key = key.replace(
-                    "local_to_speech_embedding_mlps.",
-                    "model.local_to_speech_embedding_mlps.",
-                    1,
-                )
-            elif key.startswith("layer_norm_before_lm_heads."):
-                new_key = key.replace(
-                    "layer_norm_before_lm_heads.",
-                    "model.layer_norm_before_lm_heads.",
-                    1,
                 )
             elif key.startswith("lm_heads."):
                 new_key = key.replace("lm_heads.", "model.lm_heads.", 1)
@@ -453,6 +403,16 @@ class Model(nn.Module):
             ),
         )
 
+        language = kwargs.pop("language", None)
+        saved_system_prompt = None
+        if language is not None:
+            from .config import make_language_system_prompt
+
+            saved_system_prompt = self.config.tts_system_prompt
+            self.config.tts_system_prompt = make_language_system_prompt(
+                str(language)
+            )
+
         decode_kwargs = dict(kwargs.pop("decode_kwargs", {}) or {})
         if request.decode_chunk_duration is not None:
             decode_kwargs.setdefault("chunk_duration", request.decode_chunk_duration)
@@ -540,6 +500,8 @@ class Model(nn.Module):
                 )
             finally:
                 session.close()
+                if saved_system_prompt is not None:
+                    self.config.tts_system_prompt = saved_system_prompt
             return
 
         chunks: list[mx.array] = []
@@ -563,6 +525,8 @@ class Model(nn.Module):
             )
         finally:
             session.close()
+            if saved_system_prompt is not None:
+                self.config.tts_system_prompt = saved_system_prompt
 
     @classmethod
     def post_load_hook(cls, model: "Model", model_path: Path) -> "Model":

@@ -10,9 +10,28 @@ from mlx_audio.tts.models.base import BaseModelArgs
 DEFAULT_TTS_SYSTEM_PROMPT = (
     "<|im_start|>system\n"
     "You are a highly expressive text-to-speech (TTS) engine developed by "
-    "Mosi Intelligence.\n"
+    "Mosi Intelligence. \n"
+    "You possess natural language understanding, emotional modeling, and "
+    "multi-style speech generation capabilities, allowing you to generate "
+    "the corresponding speech based on the text given in the assistant."
     "<|im_end|>\n"
 )
+
+_LANGUAGE_TTS_SYSTEM_PROMPT_TEMPLATE = (
+    "<|im_start|>system\n"
+    "You are a highly expressive {language} text-to-speech (TTS) engine "
+    "developed by Mosi Intelligence. \n"
+    "You possess natural language understanding, emotional modeling, and "
+    "multi-style speech generation capabilities, allowing you to generate "
+    "the corresponding {language} speech based on the text given in the "
+    "assistant."
+    "<|im_end|>\n"
+)
+
+
+def make_language_system_prompt(language: str) -> str:
+    """Build a system prompt conditioned on a target language."""
+    return _LANGUAGE_TTS_SYSTEM_PROMPT_TEMPLATE.format(language=language)
 
 
 def _filter_dataclass_kwargs(cls, payload: Dict[str, Any]) -> Dict[str, Any]:
